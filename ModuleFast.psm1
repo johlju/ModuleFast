@@ -2,6 +2,7 @@
 using namespace Microsoft.PowerShell.Commands
 using namespace System.Management.Automation
 using namespace NuGet.Versioning
+using namespace System.Collections
 using namespace System.Collections.Concurrent
 using namespace System.Collections.Generic
 using namespace System.Collections.Specialized
@@ -45,6 +46,9 @@ function Install-ModuleFast {
     [AllowNull()]
     [AllowEmptyCollection()]
     [Parameter(Mandatory, Position = 0, ValueFromPipeline, ParameterSetName = 'Specification')][ModuleFastSpec[]]$Specification,
+
+    #Provide a required module specification path to install from. This can be a local psd1/json file, or a remote URL with a psd1/json file in supported manifest formats.
+    [Parameter(Mandatory, ParameterSetName = 'Path')][string]$Path,
 
     #Where to install the modules. This defaults to the builtin module path on non-windows and a custom LOCALAPPDATA location on Windows.
     [string]$Destination,
@@ -111,20 +115,22 @@ function Install-ModuleFast {
 
   process {
     #We initialize and type the container list here because there is a bug where the ParameterSet is not correct in the begin block if the pipeline is used. Null conditional keeps it from being reinitialized
+    [List[ModuleFastSpec]]$ModulesToInstall = @()
     switch ($PSCmdlet.ParameterSetName) {
       'Specification' {
-        [List[ModuleFastSpec]]$ModulesToInstall ??= @()
         foreach ($ModuleToInstall in $Specification) {
           $ModulesToInstall.Add($ModuleToInstall)
         }
         break
       }
       'ModuleFastInfo' {
-        [List[ModuleFastInfo]]$ModulesToInstall ??= @()
         foreach ($ModuleToInstall in $ModuleFastInfo) {
           $ModulesToInstall.Add($ModuleToInstall)
         }
         break
+      }
+      'Path' {
+        $ModulesToInstall = ConvertFrom-RequiredSpec -RequiredSpecPath $Path
       }
     }
   }
@@ -141,15 +147,13 @@ function Install-ModuleFast {
 
     #If we do not have an explicit implementation plan, fetch it
     #This is done so that Get-ModuleFastPlan | Install-ModuleFastPlan and Install-ModuleFastPlan have the same flow.
-    [ModuleFastInfo[]]$plan = switch ($PSCmdlet.ParameterSetName) {
-      'Specification' {
-        Write-Progress -Id 1 -Activity 'Install-ModuleFast' -Status 'Plan' -PercentComplete 1
-        Get-ModuleFastPlan -Specification $ModulesToInstall -HttpClient $httpClient -Source $Source -Update:$Update -PreRelease:$Prerelease.IsPresent
-      }
-      'ModuleFastInfo' {
-        $ModulesToInstall.ToArray()
-      }
+    [ModuleFastInfo[]]$plan = if ($PSCmdlet.ParameterSetName -eq 'ModuleFastInfo') {
+      $ModulesToInstall.ToArray()
+    } else {
+      Write-Progress -Id 1 -Activity 'Install-ModuleFast' -Status 'Plan' -PercentComplete 1
+      Get-ModuleFastPlan -Specification $ModulesToInstall -HttpClient $httpClient -Source $Source -Update:$Update -PreRelease:$Prerelease.IsPresent
     }
+
 
     $WhatIfPreference = $currentWhatIfPreference
 
@@ -270,7 +274,7 @@ function Get-ModuleFastPlan {
     [HashSet[ModuleFastInfo]]$modulesToInstall = @{}
 
     # We use this as a fast lookup table for the context of the request
-    [Dictionary[Task[String], ModuleFastSpec]]$resolveTasks = @{}
+    [Dictionary[Task[String], ModuleFastSpec]]$taskSpecMap = @{}
 
     #We use this to track the tasks that are currently running
     #We dont need this to be ConcurrentList because we only manipulate it in the "main" runspace.
@@ -288,7 +292,7 @@ function Get-ModuleFastPlan {
         }
 
         $task = Get-ModuleInfoAsync @httpContext -Endpoint $Source -Name $moduleSpec.Name
-        $resolveTasks[$task] = $moduleSpec
+        $taskSpecMap[$task] = $moduleSpec
         $currentTasks.Add($task)
       }
 
@@ -309,7 +313,7 @@ function Get-ModuleFastPlan {
         #TODO: Perform a HEAD query to see if something has changed
 
         [Task[string]]$completedTask = $currentTasks[$thisTaskIndex]
-        [ModuleFastSpec]$currentModuleSpec = $resolveTasks[$completedTask]
+        [ModuleFastSpec]$currentModuleSpec = $taskSpecMap[$completedTask]
 
         Write-Debug "$currentModuleSpec`: Processing Response"
         # We use GetAwaiter so we get proper error messages back, as things such as network errors might occur here.
@@ -411,15 +415,11 @@ function Get-ModuleFastPlan {
 
             #TODO: Dedupe as a function with above
             if ($entries) {
-              [SortedSet[NuGetVersion]]$pageVersions = $entries.version
+              [SortedSet[NuGetVersion]]$inlinedVersions = $entries.version
 
-              foreach ($candidate in $pageVersions.Reverse()) {
+              foreach ($candidate in $inlinedVersions.Reverse()) {
                 #Skip Prereleases unless explicitly requested
-                if (($candidate.IsPrerelease -or $candidate.HasMetadata) -and -not ($currentModuleSpec.PreRelease -or $Prerelease)) {
-                  Write-Debug "Skipping candidate $candidate because it is a prerelease and prerelease was not specified either with the -Prerelease parameter or with a ! on the module name."
-                  continue
-                }
-
+                if (($candidate.IsPrerelease -or $candidate.HasMetadata) -and -not $Prerelease) { continue }
                 if ($currentModuleSpec.SatisfiedBy($candidate)) {
                   Write-Debug "$currentModuleSpec`: Found satisfying version $candidate in the additional pages."
                   $matchingEntry = $entries | Where-Object version -EQ $candidate
@@ -450,7 +450,7 @@ function Get-ModuleFastPlan {
         if (-not $modulesToInstall.Add($selectedModule)) {
           Write-Debug "$selectedModule already exists in the install plan. Skipping..."
           #TODO: Fix the flow so this isn't stated twice
-          [void]$resolveTasks.Remove($completedTask)
+          [void]$taskSpecMap.Remove($completedTask)
           [void]$currentTasks.Remove($completedTask)
           $tasksCompleteCount++
           continue
@@ -521,7 +521,7 @@ function Get-ModuleFastPlan {
             Write-Debug "$currentModuleSpec`: Fetching dependency $dependencySpec"
             #TODO: Do a direct version lookup if the dependency is a required version
             $task = Get-ModuleInfoAsync @httpContext -Endpoint $Source -Name $dependencySpec.Name
-            $resolveTasks[$task] = $dependencySpec
+            $taskSpecMap[$task] = $dependencySpec
             #Used to track progress as tasks can get removed
             $resolveTaskCount++
 
@@ -531,7 +531,7 @@ function Get-ModuleFastPlan {
 
         #Putting .NET methods in a try/catch makes errors in them terminating
         try {
-          [void]$resolveTasks.Remove($completedTask)
+          [void]$taskSpecMap.Remove($completedTask)
           [void]$currentTasks.Remove($completedTask)
           $tasksCompleteCount++
         } catch {
@@ -570,58 +570,34 @@ function Install-ModuleFastHelper {
   [Dictionary[Task, hashtable]]$taskMap = @{}
 
   [List[Task[Stream]]]$streamTasks = foreach ($module in $ModuleToInstall) {
-
-    $installPath = Join-Path $Destination $module.Name (Resolve-FolderVersion $module.ModuleVersion)
+    $installPath = Join-Path $Destination $module.Name $module.ModuleVersion.ToString().Split('+-')[0]
 
     #TODO: Do a get-localmodule check here
     if (Test-Path $installPath) {
-      $existingManifestPath = try {
-        Resolve-Path (Join-Path $installPath "$($module.Name).psd1") -ErrorAction Stop
-      } catch [ActionPreferenceStopException] {
-        throw "$module`: Existing module folder found at $installPath but the manifest could not be found. This is likely a corrupted or missing module and should be fixed manually."
-      }
-
-      #TODO: Dedupe all import-powershelldatafile operations to a function ideally
-      $existingModuleMetadata = Import-PowerShellDataFile $existingManifestPath
-      $existingVersion = [NugetVersion]::new(
-        $existingModuleMetadata.ModuleVersion,
-        $existingModuleMetadata.privatedata.psdata.prerelease
-      )
-
-      #Do a prerelease evaluation
-      if ($module.ModuleVersion -eq $existingVersion) {
-        if ($Update) {
-          Write-Verbose "${module}: Existing module found at $installPath and its version $existingVersion is the same as the requested version. -Update was specified so we are assuming that the discovered online version is the same as the local version and skipping this module."
-          continue
-        } else {
-          throw [System.NotImplementedException]"${module}: Existing module found at $installPath and its version $existingVersion is the same as the requested version. This is probably a bug because it should have been detected by localmodule detection. Use -Update to override..."
-        }
-      }
-      if ($module.ModuleVersion -lt $existingVersion) {
-        #TODO: Add force to override
-        throw [NotSupportedException]"${module}: Existing module found at $installPath and its version $existingVersion is newer than the requested prerelease version $($module.ModuleVersion). If you wish to continue, please remove the existing module folder or modify your specification and try again."
+      #TODO: Check for a corrupted module
+      #TODO: Prerelease checking
+      if (-not $Update) {
+        throw "${module}: Module already exists at $installPath and -Update wasn't specified. This is a bug"
       } else {
-        Write-Warning "${module}: Planned version $($module.ModuleVersion) is newer than existing prerelease version $existingVersion so we will overwrite."
-        Remove-Item $installPath -Force -Recurse
+        Write-Verbose "${module}: Module already exists at $installPath but -Update was specified. This can happen because we did in fact have the latest version. Skipping."
+        continue
       }
     }
 
-    Write-Verbose "${module}: Downloading from $($module.Location)"
+    Write-Verbose "${module}: Downloading to $($module.Location)"
     if (-not $module.Location) {
       throw "$module`: No Download Link found. This is a bug"
     }
 
-    $streamTask = $httpClient.GetStreamAsync($module.Location, $CancellationToken)
+    $fetchTask = $httpClient.GetStreamAsync($module.Location, $CancellationToken)
     $context = @{
       Module      = $module
       InstallPath = $installPath
     }
-    $taskMap.Add($streamTask, $context)
-    $streamTask
+    $taskMap.Add($fetchTask, $context)
+    $fetchTask
   }
 
-  #We are going to extract these straight out of memory, so we don't need to write the nupkg to disk
-  Write-Verbose "$($context.Module): Extracting to $($context.installPath)"
   [List[Job2]]$installJobs = while ($streamTasks.count -gt 0) {
     $noTasksYetCompleted = -1
     [int]$thisTaskIndex = [Task]::WaitAny($streamTasks, 500)
@@ -632,6 +608,8 @@ function Install-ModuleFastHelper {
     $context.fetchStream = $stream
     $streamTasks.RemoveAt($thisTaskIndex)
 
+    #We are going to extract these straight out of memory, so we don't need to write the nupkg to disk
+    Write-Verbose "$($context.Module): Extracting to $($context.installPath)"
     # This is a sync process and we want to do it in parallel, hence the threadjob
     $installJob = Start-ThreadJob -ThrottleLimit 8 {
       param(
@@ -640,16 +618,11 @@ function Install-ModuleFastHelper {
       )
       $installPath = $context.InstallPath
       #TODO: Add a ".incomplete" marker file to the folder and remove it when done. This will allow us to detect failed installations
-
       $zip = [IO.Compression.ZipArchive]::new($stream, 'Read')
       [IO.Compression.ZipFileExtensions]::ExtractToDirectory($zip, $installPath)
-      #FIXME: Output inside a threadjob is not surfaced to the user.
-      Write-Debug "Cleanup Nuget Files in $installPath"
+      Write-Verbose "Cleanup Nuget Files in $installPath"
       if (-not $installPath) { throw 'ModuleDestination was not set. This is a bug, report it' }
-      Get-ChildItem -Path $installPath | Where-Object {
-        $_.Name -in '_rels', 'package', '[Content_Types].xml' -or
-        $_.Name.EndsWith('.nuspec')
-      } | Remove-Item -Force -Recurse
+      Remove-Item -Path $installPath -Include '_rels', 'package', '*.nuspec' -Recurse -Force
 			($zip).Dispose()
 			($stream).Dispose()
       return $context
@@ -1147,15 +1120,21 @@ function Add-DestinationToPSModulePath {
   #We can't use string formatting because of the braces already present
   $profileLine = $profileLine -replace '##DESTINATION##', $Destination
 
-  if ((Get-Content -Raw $myProfile) -notmatch [Regex]::Escape($ProfileLine)) {
+  if (-not $NoProfileUpdate -and (Get-Content -Raw $myProfile) -notmatch [Regex]::Escape($ProfileLine)) {
     if (-not $PSCmdlet.ShouldProcess($myProfile, "Allow ModuleFast to work by adding $Destination to your PSModulePath on startup by appending to your CurrentUserAllHosts profile. If you do not want this, add -NoProfileUpdate to Install-ModuleFast or add the specified destination to your powershell.config.json or to your PSModulePath another way.")) { return }
     Write-Verbose "Adding $Destination to profile $myProfile"
     Add-Content -Path $myProfile -Value "`n`n"
     Add-Content -Path $myProfile -Value $ProfileLine
   } else {
-    Write-Verbose "PSModulePath $Destination already in profile, skipping..."
+    if ($NoProfileUpdate) {
+      Write-Verbose "Skipping PSModulePath $Destination update due to -NoProfileUpdate being specified"
+    } else {
+      Write-Verbose "PSModulePath $Destination already in profile, skipping Profile Update..."
+    }
   }
 }
+
+
 
 function Find-LocalModule {
   [OutputType([ModuleFastInfo])]
@@ -1197,12 +1176,10 @@ function Find-LocalModule {
     $manifestName = "$($ModuleSpec.Name).psd1"
 
     #We can attempt a fast-search for modules if the ModuleSpec is for a specific version
-    $required = $ModuleSpec.Required
-    if ($required) {
+    if ($ModuleSpec.Required) {
+      #TODO: Split this off into Find-RequiredLocalModule
 
-      #If there is a prerelease, we will fetch the folder where the prerelease might live, and verify the manifest later.
-      [Version]$moduleVersion = Resolve-FolderVersion $required
-
+      $moduleVersion = $ModuleSpec.Required.OriginalVersion
       $moduleFolder = Join-Path $moduleBaseDir $moduleVersion
       $manifestPath = Join-Path $moduleFolder $manifestName
 
@@ -1285,14 +1262,13 @@ function Find-LocalModule {
       continue
     }
 
-    [NuGetVersion]$manifestVersion = [NuGetVersion]::new(
-      $manifestVersionData,
-      $manifestData.PrivateData.PSData.Prerelease
-    )
+    [string]$prereleaseData = $manifestData.PreRelease
+
+    [NuGetVersion]$manifestVersion = [NuGetVersion]::new($manifestVersionData, $prereleaseData, $null)
 
     #Re-Test against the manifest loaded version to be sure
     if (-not $ModuleSpec.SatisfiedBy($manifestVersion)) {
-      Write-Debug "$($ModuleSpec.Name): Found a module $($moduleInfo.Item2) that initially matched the name and version folder but after reading the manifest, the version label not satisfy the version spec $($ModuleSpec). This is an edge case and should only occur if you specified a prerelease upper bound that is less than the PreRelease label in the manifest. Skipping..."
+      Write-Debug "$(ModuleSpec.Name): Found a module $($moduleInfo.Item2) that initially matched the name and version folder but after reading the manifest, the version label not satisfy the version spec $($ModuleSpec). This is an edge case and should only occur if you specified a prerelease upper bound that is less than the PreRelease label in the manifest. Skipping..."
       continue
     }
 
@@ -1334,6 +1310,101 @@ filter ConvertFrom-RequiredSpec {
     [Parameter(Mandatory, ParameterSetName = 'Object')][object]$RequiredSpec
   )
   $ErrorActionPreference = 'Stop'
+
+  if ($RequiredSpecPath) {
+    $uri = $RequiredSpecPath -as [Uri]
+
+    $RequiredData = if ($uri.scheme -in 'http', 'https') {
+      [string]$content = (Invoke-WebRequest -Uri $uri).Content
+      if ($content.StartsWith('@{')) {
+        $tempFile = [io.path]::GetTempFileName()
+        $content > $tempFile
+        Import-PowerShellDataFile -Path $tempFile
+      } else {
+        ConvertFrom-Json $content -Depth 5
+      }
+    } else {
+      #Assume this is a local if a URL above didn't match
+      $resolvedPath = Resolve-Path $RequiredSpecPath
+      $extension = [Path]::GetExtension($resolvedPath)
+      if ($extension -eq '.psd1') {
+        Import-PowerShellDataFile -Path $resolvedPath
+      } elseif ($extension -in '.json', '.jsonc') {
+        Get-Content -Path $resolvedPath -Raw | ConvertFrom-Json -Depth 5
+      } else {
+        throw [NotSupportedException]'Only .psd1 and .json files are supported to import to this command'
+      }
+    }
+  }
+
+
+
+  if ($RequiredData -is [IDictionary]) {
+    foreach ($kv in $RequiredData.GetEnumerator()) {
+      if ($kv.Value -is [IDictionary]) {
+        throw [NotImplementedException]'TODO: PSResourceGet/PSDepend full syntax'
+      }
+      if ($kv.Value -isnot [string]) {
+        throw [NotSupportedException]'Only strings and hashtables are supported on the right hand side of the = operator.'
+      }
+      if ($kv.Value -eq 'latest') {
+        [ModuleFastSpec]"$($kv.Name)"
+        continue
+      }
+      if ($kv.Value -as [NuGetVersion]) {
+        [ModuleFastSpec]"$($kv.Name)@$($kv.Value)"
+        continue
+      }
+
+      #All other potential options (<=, @, :, etc.) are a direct merge
+      [ModuleFastSpec]"$($kv.Name)$($kv.Value)"
+    }
+  } else {
+    throw [NotImplementedException]'TODO: Support simple array based json strings'
+  }
+}
+
+
+#endregion Helpers
+
+### ISSUES
+# FIXME: When doing directory match comparison for local modules, need to preserve original folder name. See: Reflection 4.8
+#   To fix this we will just use the name out of the module.psd1 when installing
+# FIXME: DBops dependency version issue
+
+Export-ModuleMember -Function Get-ModuleFastPlan), {
+  if ($kv.Value -is [IDictionary] In
+    throw [NotImplementedException]'TODO: PSResourceGet/PSDepend full syntax'
+  }
+  if ($kv.Value -isnot [string]) {
+    throw [NotSupportedException]'Only strings and hashtables are supported on the right hand side of the = operator.'
+  }
+  if ($kv.Value -eq 'latest') {
+    [ModuleFastSpec]"$($kv.Name)"
+    continue
+  }
+  if ($kv.Value -as [NuGetVersion]) {
+    [ModuleFastSpec]"$($kv.Name)@$($kv.Value)"
+    continue
+  }
+
+  #All other potential options (<=, @, :, etc.) are a direct merge
+  [ModuleFastSpec]"$($kv.Name)$($kv.Value)"
+}
+} else {
+  throw [NotImplementedException]'TODO: Support simple array based json strings'
+}
+}
+
+
+#endregion Helpers
+
+### ISSUES
+# FIXME: When doing directory match comparison for local modules, need to preserve original folder name. See: Reflection 4.8
+#   To fix this we will just use the name out of the module.psd1 when installing
+# FIXME: DBops dependency version issue
+
+Export-ModuleMember -Function Get-ModuleFastPlan, Install-ModuleFaststall-ModuleFast
 
   if ($RequiredSpecPath) {
     $uri = $RequiredSpecPath -as [Uri]

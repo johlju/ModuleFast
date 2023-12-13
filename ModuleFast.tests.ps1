@@ -10,6 +10,7 @@ Import-Module $PSScriptRoot/ModuleFast.psm1 -Force
 BeforeAll {
   if ($env:MFURI) {
     $PSDefaultParameterValues['Get-ModuleFastPlan:Source'] = $env:MFURI
+    $PSDefaultParameterValues['Install-ModuleFast:Source'] = $env:MFURI
   }
 }
 
@@ -229,7 +230,7 @@ Describe 'Get-ModuleFastPlan' -Tag 'E2E' {
           Spec       = 'PrereleaseTest!'
           Check      = {
             $actual.Name | Should -Be 'PrereleaseTest'
-            $actual.ModuleVersion | Should -Be '0.0.2-prerelease'
+            $actual.ModuleVersion | Should -Be '0.0.2-newerversion'
           }
           ModuleName = 'PrereleaseTest'
         },
@@ -237,7 +238,7 @@ Describe 'Get-ModuleFastPlan' -Tag 'E2E' {
           Spec       = '!PrereleaseTest'
           Check      = {
             $actual.Name | Should -Be 'PrereleaseTest'
-            $actual.ModuleVersion | Should -Be '0.0.2-prerelease'
+            $actual.ModuleVersion | Should -Be '0.0.2-newerversion'
           }
           ModuleName = 'PrereleaseTest'
         },
@@ -245,7 +246,7 @@ Describe 'Get-ModuleFastPlan' -Tag 'E2E' {
           Spec       = 'PrereleaseTest!<0.0.1'
           Check      = {
             $actual.Name | Should -Be 'PrereleaseTest'
-            $actual.ModuleVersion | Should -Be '0.0.1-prerelease'
+            $actual.ModuleVersion | Should -Be '0.0.1-newerversion'
           }
           ModuleName = 'PrereleaseTest'
         }
@@ -316,7 +317,7 @@ Describe 'Get-ModuleFastPlan' -Tag 'E2E' {
         $actual = 'Az.Accounts!', 'PrereleaseTest' | Get-ModuleFastPlan -PreRelease
         $actual | Should -HaveCount 2
         $actual | Where-Object Name -EQ 'PrereleaseTest' | ForEach-Object {
-          $PSItem.ModuleVersion | Should -Be '0.0.2-prerelease'
+          $PSItem.ModuleVersion | Should -Be '0.0.2-newerversion'
         }
       }
     }
@@ -353,11 +354,11 @@ Describe 'Get-ModuleFastPlan' -Tag 'E2E' {
   }
   It 'Shows Prerelease Modules if Prerelease is specified' {
     $actual = Get-ModuleFastPlan 'PrereleaseTest' -PreRelease
-    $actual.ModuleVersion | Should -Be '0.0.2-prerelease'
+    $actual.ModuleVersion | Should -Be '0.0.2-newerversion'
   }
   It 'Detects Prerelease even if Prerelease not specified' {
-    $actual = Get-ModuleFastPlan 'PrereleaseTest@0.0.2-prerelease'
-    $actual.ModuleVersion | Should -Be '0.0.2-prerelease'
+    $actual = Get-ModuleFastPlan 'PrereleaseTest@0.0.2-newerversion'
+    $actual.ModuleVersion | Should -Be '0.0.2-newerversion'
   }
 
 }
@@ -404,7 +405,7 @@ Describe 'Install-ModuleFast' -Tag 'E2E' {
     Get-Item $installTempPath\Az.Accounts\*\Az.Accounts.psd1 | Should -Not -BeNullOrEmpty
   }
   It '4 section version numbers (VMware.PowerCLI)' {
-    Install-ModuleFast @imfParams 'VMware.VimAutomation.Common@13.2.0.22643733'
+    Install-ModuleFast @imfParams 'VMware.VimAutomation.Common'
     Get-Item $installTempPath\VMware*\*\*.psd1 | ForEach-Object {
       $moduleFolderVersion = $_ | Split-Path | Split-Path -Leaf
       Import-PowerShellDataFile -Path $_.FullName | Select-Object -ExpandProperty ModuleVersion | Should -Be $moduleFolderVersion
@@ -501,4 +502,68 @@ Describe 'Install-ModuleFast' -Tag 'E2E' {
     Install-ModuleFast @imfParams 'PrereleaseTest@0.0.1-bprerelease' -WarningVariable actual *>&1 | Out-Null
     $actual | Should -BeLike '*is newer than existing prerelease version*'
   }
+
+  It 'Installs from <Name>' {
+    $SCRIPT:Mocks = Resolve-Path "$PSScriptRoot/Test/Mocks"
+    Install-ModuleFast @imfParams -Path $Mocks/ModuleFast.requires.psd1
+
+    Get-Module ImportExcel -ListAvailable
+    | Limit-ModulePath $installTempPath
+    | Select-Object -ExpandProperty Version
+    | Sort-Object Version -Descending
+    | Select-Object -First 1
+    | Should -BeGreaterThan ([version]'7.8.5')
+
+    Get-Module Pester -ListAvailable
+    | Limit-ModulePath $installTempPath
+    | Select-Object -ExpandProperty Version
+    | Sort-Object Version -Descending
+    | Select-Object -First 1
+    | Should -Be ([version]'5.4.0')
+  } -TestCases @(
+    @{
+      Name = 'PowerShell Data File';
+      Path = "$PSScriptRoot/Test/Mocks/ModuleFast.requires.psd1"
+    },
+    @{
+      Name = 'JSON';
+      Path = "$PSScriptRoot/Test/Mocks/ModuleFast.requires.json"
+    },
+    @{
+      Name = 'JSONArray';
+      Path = "$PSScriptRoot/Test/Mocks/ModuleFastArray.requires.json"
+    }
+  )
+
+  It 'Installs from <Name>' {
+    $SCRIPT:Mocks = Resolve-Path "$PSScriptRoot/Test/Mocks"
+    Install-ModuleFast @imfParams -Path $Mocks/ModuleFast.requires.psd1
+
+    Get-Module ImportExcel -ListAvailable
+    | Limit-ModulePath $installTempPath
+    | Select-Object -ExpandProperty Version
+    | Sort-Object Version -Descending
+    | Select-Object -First 1
+    | Should -BeGreaterThan ([version]'7.8.5')
+
+    Get-Module Pester -ListAvailable
+    | Limit-ModulePath $installTempPath
+    | Select-Object -ExpandProperty Version
+    | Sort-Object Version -Descending
+    | Select-Object -First 1
+    | Should -Be ([version]'5.4.0')
+  } -TestCases @(
+    @{
+      Name = 'PowerShell Data File';
+      Path = "$PSScriptRoot/Test/Mocks/ModuleFast.requires.psd1"
+    },
+    @{
+      Name = 'JSON';
+      Path = "$PSScriptRoot/Test/Mocks/ModuleFast.requires.json"
+    },
+    @{
+      Name = 'JSONArray';
+      Path = "$PSScriptRoot/Test/Mocks/ModuleFastArray.requires.json"
+    }
+  )
 }
